@@ -6,4 +6,5 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
-user_settings.json
+user_settings.jsonenviron
+environ/
