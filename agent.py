@@ -9,12 +9,19 @@ Architecture:
   • Tool result cache — shared across LLM fallback chain.
   • LLM fallback across 8 free OpenRouter tool-calling models.
   • Recursion limit 100 to support 10-25 tool call research flows.
+
+Deployment modes:
+  • Local CLI:   `python agent.py "analyze MU"` — uses .env + local venv binary
+  • Streamlit:   imported by app.py — uses st.secrets + pip-installed binary
+  • The secrets ladder (st.secrets → .env → os.environ) works in both.
 """
 
 import asyncio
 import argparse
 import json
 import os
+import shutil
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -26,7 +33,92 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 WORKSPACE = Path(__file__).resolve().parent
 load_dotenv(WORKSPACE / ".env")
 
-OPENBB_BIN = WORKSPACE / "environ" / "bin" / "openbb-mcp"
+
+# =============================================================================
+# SECRETS LADDER — works identically local + Streamlit Cloud
+# =============================================================================
+# Order: st.secrets (when hosted on Streamlit) → .env (local dev) → os.environ
+
+def get_secret(key: str, default=None):
+    """Ladder: Streamlit secrets → .env → os.environ → default.
+
+    Safe to call from both CLI and Streamlit runtime. The streamlit import
+    only fires if it's already loaded in the process (i.e. we're inside
+    `streamlit run app.py`). CLI runs never touch it.
+    """
+    # Only check st.secrets if streamlit is loaded — avoids import cost
+    # and FileNotFoundError when there's no secrets.toml locally.
+    if "streamlit" in sys.modules:
+        try:
+            import streamlit as st
+            if hasattr(st, "secrets") and key in st.secrets:
+                return st.secrets[key]
+        except Exception:
+            pass
+    return os.getenv(key, default)
+
+
+def configure_openbb_credentials():
+    """Write API keys from the secrets ladder into OpenBB's credential store.
+
+    On local dev this is a no-op because user_settings.json is symlinked at
+    ~/.openbb_platform/ with the real keys. On Streamlit Cloud there's no
+    JSON file — we programmatically push keys from st.secrets into OpenBB
+    at startup so the spawned MCP subprocess inherits them via env vars.
+
+    Set env vars BEFORE the MCP subprocess spawns. OpenBB providers read
+    from OPENBB_* env vars as a fallback when user_settings.json is absent.
+    """
+    key_map = {
+        "FMP_API_KEY":      "OPENBB_API_FMP_API_KEY",
+        "FRED_API_KEY":     "OPENBB_API_FRED_API_KEY",
+        "TIINGO_TOKEN":     "OPENBB_API_TIINGO_TOKEN",
+        "BENZINGA_API_KEY": "OPENBB_API_BENZINGA_API_KEY",
+    }
+    configured = []
+    for user_key, openbb_env_key in key_map.items():
+        value = get_secret(user_key)
+        if value:
+            os.environ[openbb_env_key] = str(value)
+            # Also set the short form OpenBB reads in some code paths
+            os.environ[user_key.lower()] = str(value)
+            configured.append(user_key)
+    return configured
+
+
+# =============================================================================
+# OPENBB-MCP BINARY RESOLVER — works local + Streamlit Cloud
+# =============================================================================
+
+def resolve_openbb_bin() -> str:
+    """Find the openbb-mcp binary across deployment environments.
+
+    Resolution order:
+      1. Local dev venv inside repo: ./environ/bin/openbb-mcp (or symlink)
+      2. PATH resolution (Streamlit Cloud after pip install)
+      3. Sibling to current Python interpreter (pip install --user cases)
+    """
+    # 1. Local dev — venv inside repo, symlinked or real
+    local = WORKSPACE / "environ" / "bin" / "openbb-mcp"
+    if local.exists():
+        return str(local)
+
+    # 2. PATH — Streamlit Cloud installs to the container's Python bin dir
+    which = shutil.which("openbb-mcp")
+    if which:
+        return which
+
+    # 3. Sibling to sys.executable (belt-and-suspenders)
+    sibling = Path(sys.executable).parent / "openbb-mcp"
+    if sibling.exists():
+        return str(sibling)
+
+    raise SystemExit(
+        "openbb-mcp binary not found. Install with: pip install openbb-mcp-server"
+    )
+
+
+OPENBB_BIN = resolve_openbb_bin()
 RECURSION_LIMIT = 100
 
 HARD_DROPS = {
@@ -94,13 +186,35 @@ def _format_error_for_llm(tool_name, err, attempted_providers):
     )
 
 
+# Optional stream callback — Streamlit UI sets this to render fallbacks live.
+# Signature: (level: str, message: str) -> None
+_STREAM_CALLBACK = None
+
+
+def set_stream_callback(cb):
+    """UI layer (Streamlit) calls this to receive fallback/cache events."""
+    global _STREAM_CALLBACK
+    _STREAM_CALLBACK = cb
+
+
+def _emit(level: str, message: str):
+    """Emit to stream callback if set, else print (CLI path)."""
+    if _STREAM_CALLBACK:
+        try:
+            _STREAM_CALLBACK(level, message)
+            return
+        except Exception:
+            pass
+    print(message)
+
+
 def wrap_tool(t):
     if not hasattr(t, "coroutine") or t.coroutine is None:
         return t
 
     original_coro = t.coroutine
     tool_name = t.name
-    # ← NEW: detect expected return shape
+    # Detect expected return shape (LangChain supports content vs. content+artifact)
     response_format = getattr(t, "response_format", "content")
 
     def _shape(payload):
@@ -136,9 +250,9 @@ def wrap_tool(t):
             retry_kwargs = {**kwargs, "provider": alt}
             retry_key = _cache_key(tool_name, retry_kwargs)
             if retry_key in _TOOL_CACHE:
-                print(f"  ♻ {tool_name} ({alt}): cached")
+                _emit("cache", f"  ♻ {tool_name} ({alt}): cached")
                 return _TOOL_CACHE[retry_key]
-            print(f"  ⤷ {tool_name}: {provider} blocked → {alt}")
+            _emit("fallback", f"  ⤷ {tool_name}: {provider} blocked → {alt}")
             try:
                 result = await original_coro(*args, **retry_kwargs)
                 _TOOL_CACHE[retry_key] = result
@@ -151,6 +265,7 @@ def wrap_tool(t):
 
     t.coroutine = wrapped
     return t
+
 
 def apply_wrappers(tools):
     count = 0
@@ -187,22 +302,33 @@ DEFAULT_FALLBACK_ORDER = [
 def build_model(provider: str, variant: str):
     if provider == "openrouter":
         from langchain_openai import ChatOpenAI
-        if not os.getenv("OPENROUTER_API_KEY"):
-            raise SystemExit("OPENROUTER_API_KEY missing from .env")
+        api_key = get_secret("OPENROUTER_API_KEY")
+        if not api_key:
+            raise SystemExit("OPENROUTER_API_KEY missing from secrets/.env")
         model_name = OPENROUTER_MODELS.get(variant, variant)
         return ChatOpenAI(
             model=model_name,
             temperature=0,
             base_url="https://openrouter.ai/api/v1",
-            api_key=os.getenv("OPENROUTER_API_KEY"),
+            api_key=api_key,
         ), model_name
     elif provider == "gemini":
         from langchain_google_genai import ChatGoogleGenerativeAI
         print("⚠  Gemini has int-enum schema issues with OpenBB.")
-        return ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0), "gemini-2.5-flash"
+        api_key = get_secret("GOOGLE_API_KEY") or get_secret("GEMINI_API_KEY")
+        return ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            temperature=0,
+            google_api_key=api_key,
+        ), "gemini-2.5-flash"
     elif provider == "groq":
         from langchain_groq import ChatGroq
-        return ChatGroq(model="llama-3.3-70b-versatile", temperature=0), "llama-3.3-70b-versatile"
+        api_key = get_secret("GROQ_API_KEY")
+        return ChatGroq(
+            model="llama-3.3-70b-versatile",
+            temperature=0,
+            groq_api_key=api_key,
+        ), "llama-3.3-70b-versatile"
     else:
         raise SystemExit(f"Unknown provider: {provider}")
 
@@ -396,7 +522,15 @@ HARD RULES
 # RUNTIME
 # =============================================================================
 
-async def stream_agent(agent, prompt: str, config=None):
+async def stream_agent(agent, prompt: str, config=None, on_event=None):
+    """Stream agent turns. If on_event is provided, emit structured events
+    to it for UI rendering; otherwise print to stdout (CLI mode).
+
+    Event shapes emitted to on_event:
+      {"type": "tool_call", "name": str, "args": dict}
+      {"type": "tool_result", "name": str, "content": str, "is_error": bool}
+      {"type": "assistant_message", "content": str}
+    """
     config = config or {}
     async for chunk in agent.astream(
         {"messages": [{"role": "user", "content": prompt}]},
@@ -408,16 +542,29 @@ async def stream_agent(agent, prompt: str, config=None):
         if msg_type == "AIMessage":
             tool_calls = getattr(msg, "tool_calls", None) or []
             for tc in tool_calls:
-                args_str = str(tc.get("args", {}))[:150]
-                print(f"🔧 {tc['name']}({args_str})")
+                if on_event:
+                    on_event({"type": "tool_call", "name": tc["name"],
+                              "args": tc.get("args", {})})
+                else:
+                    args_str = str(tc.get("args", {}))[:150]
+                    print(f"🔧 {tc['name']}({args_str})")
             if msg.content and not tool_calls:
-                print(f"\n💬 {msg.content}\n")
+                if on_event:
+                    on_event({"type": "assistant_message", "content": msg.content})
+                else:
+                    print(f"\n💬 {msg.content}\n")
         elif msg_type == "ToolMessage":
-            content = str(msg.content).replace("\n", " ")[:180]
-            if content.startswith("⚠"):
-                print(f"📨 {msg.name} → {content}")
+            content = str(msg.content)
+            is_error = content.startswith("⚠")
+            if on_event:
+                on_event({"type": "tool_result", "name": msg.name,
+                          "content": content, "is_error": is_error})
             else:
-                print(f"📨 {msg.name} → {content[:100]}...")
+                content_flat = content.replace("\n", " ")[:180]
+                if is_error:
+                    print(f"📨 {msg.name} → {content_flat}")
+                else:
+                    print(f"📨 {msg.name} → {content_flat[:100]}...")
 
 
 def is_fatal_llm_error(err: Exception) -> bool:
@@ -431,16 +578,33 @@ def is_fatal_llm_error(err: Exception) -> bool:
     return False
 
 
-async def run_with_fallback(prompt, provider, variant, agent_tools):
+async def run_with_fallback(prompt, provider, variant, agent_tools, on_event=None):
+    """LLM fallback chain. Hits `variant` first, then cascades through
+    DEFAULT_FALLBACK_ORDER on non-fatal errors.
+
+    If on_event is provided, structured events go there for UI rendering.
+    Otherwise prints to stdout (CLI mode).
+    """
     config = {"recursion_limit": RECURSION_LIMIT}
+
+    def _emit_model_event(model_name, status):
+        if on_event:
+            on_event({"type": "model_status", "model": model_name, "status": status})
+        else:
+            if status == "trying":
+                print(f"\n→ trying LLM: {model_name}")
+            elif status == "succeeded":
+                print(f"\n✓ succeeded with {model_name} "
+                      f"(cached {len(_TOOL_CACHE)} unique tool results)")
 
     if provider != "openrouter":
         model, model_name = build_model(provider, variant)
-        print(f"→ using: {model_name}")
+        _emit_model_event(model_name, "trying")
         agent = create_agent(model, agent_tools, system_prompt=SYSTEM_PROMPT)
-        print("─" * 70)
-        await stream_agent(agent, prompt, config=config)
-        print("─" * 70)
+        if not on_event:
+            print("─" * 70)
+        await stream_agent(agent, prompt, config=config, on_event=on_event)
+        _emit_model_event(model_name, "succeeded")
         return
 
     order = [variant] + [v for v in DEFAULT_FALLBACK_ORDER if v != variant]
@@ -448,35 +612,47 @@ async def run_with_fallback(prompt, provider, variant, agent_tools):
 
     for v in order:
         model_name = OPENROUTER_MODELS.get(v, v)
-        print(f"\n→ trying LLM: {model_name}")
+        _emit_model_event(model_name, "trying")
         try:
             model, _ = build_model(provider, v)
             agent = create_agent(model, agent_tools, system_prompt=SYSTEM_PROMPT)
-            print("─" * 70)
-            await stream_agent(agent, prompt, config=config)
-            print("─" * 70)
-            print(f"\n✓ succeeded with {model_name} "
-                  f"(cached {len(_TOOL_CACHE)} unique tool results)")
+            if not on_event:
+                print("─" * 70)
+            await stream_agent(agent, prompt, config=config, on_event=on_event)
+            _emit_model_event(model_name, "succeeded")
             return
         except Exception as e:
             err_cls = type(e).__name__
             msg = str(e)[:180]
             if is_fatal_llm_error(e):
-                print(f"  ✗ FATAL {err_cls}: {msg}")
+                if on_event:
+                    on_event({"type": "fatal_error",
+                              "message": f"{err_cls}: {msg}"})
+                else:
+                    print(f"  ✗ FATAL {err_cls}: {msg}")
                 raise
-            # NOTE: ToolException is no longer possible here because the
-            # wrapper returns error strings instead of raising.
-            print(f"  ✗ {err_cls}: {msg} — falling through")
+            if on_event:
+                on_event({"type": "model_status", "model": model_name,
+                          "status": "failed", "error": f"{err_cls}: {msg}"})
+            else:
+                print(f"  ✗ {err_cls}: {msg} — falling through")
             errors.append((v, err_cls))
             continue
 
-    print("\n❌ All OpenRouter free variants exhausted.")
-    print("   Options: wait 5 min, or use --variant deepseek (paid, ~$0.02/query)")
-    for v, cls in errors:
-        print(f"   {v}: {cls}")
+    exhausted_msg = ("All OpenRouter free variants exhausted. "
+                     "Options: wait 5 min, or use --variant deepseek (paid).")
+    if on_event:
+        on_event({"type": "fatal_error", "message": exhausted_msg})
+    else:
+        print(f"\n❌ {exhausted_msg}")
+        for v, cls in errors:
+            print(f"   {v}: {cls}")
 
 
-async def main(prompt: str, provider: str, variant: str):
+async def build_agent_tools():
+    """Spawn OpenBB MCP subprocess, fetch tools, apply wrappers. Returns
+    (agent_tools, total_count, active_count, wrapped_count).
+    """
     client = MultiServerMCPClient({
         "openbb": {
             "transport": "stdio",
@@ -490,10 +666,19 @@ async def main(prompt: str, provider: str, variant: str):
     default_tools, wrapped_count = apply_wrappers(default_tools)
     broaden = make_broaden_tool(all_tools)
     agent_tools = default_tools + [broaden]
+    return agent_tools, len(all_tools), len(agent_tools), wrapped_count
+
+
+async def main(prompt: str, provider: str, variant: str):
+    configured = configure_openbb_credentials()
+    if configured:
+        print(f"→ configured OpenBB credentials: {', '.join(configured)}")
+
+    agent_tools, total, active, wrapped = await build_agent_tools()
 
     print(f"\n→ provider: {provider}")
-    print(f"→ {len(all_tools)} tools available, {len(agent_tools)} active "
-          f"({wrapped_count} wrapped fault-tolerant)")
+    print(f"→ {total} tools available, {active} active "
+          f"({wrapped} wrapped fault-tolerant)")
     print(f"→ recursion limit: {RECURSION_LIMIT} (deep research enabled)")
 
     await run_with_fallback(prompt, provider, variant, agent_tools)
