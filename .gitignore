@@ -1,0 +1,9 @@
+environ/
+.env
+user_settings.json
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.idea/
+user_settings.json

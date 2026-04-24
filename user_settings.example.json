@@ -1,0 +1,8 @@
+{
+  "credentials": {
+    "fmp_api_key": "<YOUR_FRED_API_KEY>",
+    "fred_api_key": "<YOUR_FRED_API_KEY>",
+    "tiingo_token": "<YOUR_TIINGO_TOKEN>",
+    "benzinga_api_key": "<YOUR_BENZINGA_API_KEY>"
+  }
+}
