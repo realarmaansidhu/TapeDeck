@@ -9,13 +9,19 @@ Deployment:
   streamlit run app.py                # local
   Streamlit Cloud                     # point at this repo, add secrets
 """
-
 import asyncio
 import json
 import time
 from pathlib import Path
 
 import streamlit as st
+
+# Streamlit runs on tornado which has its own event loop. nest_asyncio
+# patches asyncio to allow our cached MCP loop to be re-entered safely
+# across Streamlit reruns — otherwise run_until_complete() raises
+# RuntimeError and coroutines get orphaned ("never awaited" warning).
+import nest_asyncio
+nest_asyncio.apply()
 
 # agent.py MUST be imported after Streamlit is in sys.modules so that
 # get_secret() can find st.secrets at runtime.

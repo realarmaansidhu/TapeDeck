@@ -59,32 +59,54 @@ def get_secret(key: str, default=None):
 
 
 def configure_openbb_credentials():
-    """Write API keys from the secrets ladder into OpenBB's credential store.
+    """Write API keys into OpenBB's canonical credential file at
+    ~/.openbb_platform/user_settings.json.
 
-    On local dev this is a no-op because user_settings.json is symlinked at
-    ~/.openbb_platform/ with the real keys. On Streamlit Cloud there's no
-    JSON file — we programmatically push keys from st.secrets into OpenBB
-    at startup so the spawned MCP subprocess inherits them via env vars.
-
-    Set env vars BEFORE the MCP subprocess spawns. OpenBB providers read
-    from OPENBB_* env vars as a fallback when user_settings.json is absent.
+    This is OpenBB's documented config mechanism — far more reliable than
+    env vars because it's read deterministically on subprocess startup
+    regardless of how the process is spawned. On local dev this overwrites
+    the symlinked file harmlessly with the same values; on Streamlit Cloud
+    / HF Spaces / Docker it creates the file fresh from st.secrets.
     """
-    key_map = {
-        "FMP_API_KEY":      "OPENBB_API_FMP_API_KEY",
-        "FRED_API_KEY":     "OPENBB_API_FRED_API_KEY",
-        "TIINGO_TOKEN":     "OPENBB_API_TIINGO_TOKEN",
-        "BENZINGA_API_KEY": "OPENBB_API_BENZINGA_API_KEY",
+    import json as _json
+    from pathlib import Path as _Path
+
+    cred_map = {
+        "FMP_API_KEY":      "fmp_api_key",
+        "FRED_API_KEY":     "fred_api_key",
+        "TIINGO_TOKEN":     "tiingo_token",
+        "BENZINGA_API_KEY": "benzinga_api_key",
     }
+
+    creds = {}
     configured = []
-    for user_key, openbb_env_key in key_map.items():
+    for user_key, openbb_key in cred_map.items():
         value = get_secret(user_key)
         if value:
-            os.environ[openbb_env_key] = str(value)
-            # Also set the short form OpenBB reads in some code paths
-            os.environ[user_key.lower()] = str(value)
+            creds[openbb_key] = str(value)
             configured.append(user_key)
-    return configured
+            # Belt-and-suspenders env var (some OpenBB code paths read these)
+            os.environ[openbb_key] = str(value)
 
+    if creds:
+        settings_dir = _Path.home() / ".openbb_platform"
+        settings_dir.mkdir(parents=True, exist_ok=True)
+        settings_file = settings_dir / "user_settings.json"
+
+        # Preserve any existing settings (like preferences) if file exists
+        existing = {}
+        if settings_file.exists() and not settings_file.is_symlink():
+            try:
+                existing = _json.loads(settings_file.read_text())
+            except Exception:
+                existing = {}
+
+        # Only write if this isn't a symlink (don't clobber local dev setup)
+        if not settings_file.is_symlink():
+            existing["credentials"] = creds
+            settings_file.write_text(_json.dumps(existing, indent=2))
+
+    return configured
 
 # =============================================================================
 # OPENBB-MCP BINARY RESOLVER — works local + Streamlit Cloud
